@@ -1,1 +1,96 @@
+name: Build HONOR Band 5 HWT
 
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Extract Obsidian Gold source archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Filter 'Obsidian_Gold_HB5_Source.zip' -File -Recurse | Select-Object -First 1
+          if (-not $archive) {
+            throw 'Upload Obsidian_Gold_HB5_Source.zip to the repository root, then run this workflow again.'
+          }
+
+          $dest = Join-Path $env:RUNNER_TEMP 'hb5-source'
+          if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath $dest -Force
+
+          $project = Get-ChildItem -Path $dest -Directory -Recurse |
+            Where-Object { Test-Path (Join-Path $_.FullName 'package_bandtool.bat') } |
+            Select-Object -First 1
+
+          if (-not $project) {
+            throw 'Could not find package_bandtool.bat inside the source archive.'
+          }
+
+          "HB5_PROJECT=$($project.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Run the original Windows packaging script
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location $env:HB5_PROJECT
+
+          # Redirect stdin to NUL so the script's final PAUSE does not hang CI.
+          cmd.exe /d /c 'package_bandtool.bat < NUL'
+          if ($LASTEXITCODE -ne 0) {
+            throw "package_bandtool.bat failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Validate and collect HWT output
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $hwtFiles = Get-ChildItem -Path $env:HB5_PROJECT -Filter '*.hwt' -File -Recurse
+          if (-not $hwtFiles) {
+            throw 'The packaging script finished but no .hwt file was found. Review the build log.'
+          }
+
+          $outDir = Join-Path $env:GITHUB_WORKSPACE 'hwt-output'
+          New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+
+          foreach ($file in $hwtFiles) {
+            if ($file.Length -gt 5MB) {
+              throw "$($file.Name) is larger than 5 MB."
+            }
+
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($file.FullName)
+            try {
+              $main = $zip.Entries | Where-Object { $_.FullName -eq 'com.huawei.watchface' } | Select-Object -First 1
+              if (-not $main) {
+                throw "$($file.Name) does not contain com.huawei.watchface."
+              }
+              if ($main.Length -gt 600KB) {
+                throw "com.huawei.watchface in $($file.Name) exceeds 600 KB."
+              }
+            }
+            finally {
+              $zip.Dispose()
+            }
+
+            Copy-Item -LiteralPath $file.FullName -Destination $outDir
+            Write-Host "Validated package: $($file.Name) ($($file.Length) bytes)"
+          }
+
+      - name: Upload HWT build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Obsidian-Gold-HONOR-Band-5-HWT
+          path: hwt-output/*.hwt
+          if-no-files-found: error
+          retention-days: 7
